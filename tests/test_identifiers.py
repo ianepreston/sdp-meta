@@ -15,6 +15,11 @@ from databricks.labs.sdp_meta.identifiers import (
     SUPPORTED_SCD_TYPES,
     SUPPORTED_SOURCE_FORMATS,
     is_regular_identifier,
+    validate_column_comment,
+    validate_column_comments,
+    validate_column_mask_clause,
+    validate_column_masks,
+    parse_sequence_by_columns,
     validate_scd_type,
     validate_sequence_by,
     validate_source_format,
@@ -392,6 +397,42 @@ class ValidateSequenceByTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"my_seq_field"):
             validate_sequence_by("bad-col", kind="my_seq_field")
 
+    def test_expression_coalesce_rejected(self):
+        # struct(*cols) treats each entry as a column NAME, so an expression
+        # must be rejected with a clear message (bare-column-only contract).
+        with self.assertRaisesRegex(ValueError, r"expression"):
+            validate_sequence_by("coalesce(a,b)")
+
+    def test_expression_cast_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"expression"):
+            validate_sequence_by("cast(x as decimal(10,2))")
+
+    def test_expression_embedded_space_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"expression"):
+            validate_sequence_by("a b")
+
+
+class ParseSequenceByColumnsTests(unittest.TestCase):
+    """``parse_sequence_by_columns`` is the single source of truth turning a
+    sequence_by spec into the bare column list both the apply-time struct and
+    the SCD2 type derivation consume."""
+
+    def test_single(self):
+        self.assertEqual(parse_sequence_by_columns("event_ts"), ["event_ts"])
+
+    def test_composite_strips_whitespace(self):
+        self.assertEqual(parse_sequence_by_columns(" ts , id "), ["ts", "id"])
+
+    def test_dotted_preserved(self):
+        self.assertEqual(
+            parse_sequence_by_columns("_metadata.file_path"),
+            ["_metadata.file_path"],
+        )
+
+    def test_expression_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"expression"):
+            parse_sequence_by_columns("coalesce(a, b)")
+
 
 class ValidateSqlWhereClauseTests(unittest.TestCase):
     """``where_clause`` denylist for the Metadata Browse table preview.
@@ -485,6 +526,129 @@ class ValidateSqlWhereClauseTests(unittest.TestCase):
     def test_kind_appears_in_error(self):
         with self.assertRaisesRegex(ValueError, r"row_filter"):
             validate_sql_where_clause("1=1;", kind="row_filter")
+
+
+class ValidateColumnCommentTests(unittest.TestCase):
+    def test_none_and_empty_ok(self):
+        self.assertEqual(validate_column_comment(None), "")
+        self.assertEqual(validate_column_comment(""), "")
+
+    def test_free_text_including_keywords_ok(self):
+        # No dangerous-keyword denylist — a comment is a quoted literal.
+        v = "the customer's select preference (union of regions)"
+        self.assertEqual(validate_column_comment(v), v)
+
+    def test_non_string_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_comment(123)
+
+    def test_too_long_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_comment("x" * 1001)
+
+    def test_control_chars_raise(self):
+        with self.assertRaisesRegex(ValueError, "control characters"):
+            validate_column_comment("line1\nline2")
+
+
+class ValidateColumnMaskClauseTests(unittest.TestCase):
+    def test_none_and_empty_ok(self):
+        self.assertEqual(validate_column_mask_clause(None), "")
+        self.assertEqual(validate_column_mask_clause(""), "")
+
+    def test_bare_function_name_ok(self):
+        v = "cat.sec.mask_ssn"
+        self.assertEqual(validate_column_mask_clause(v), v)
+
+    def test_using_columns_ok(self):
+        v = "cat.sec.mask_ssn USING COLUMNS (region, tier)"
+        self.assertEqual(validate_column_mask_clause(v), v)
+
+    def test_bad_function_name_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_mask_clause("bad-name USING COLUMNS (a)")
+
+    def test_bad_using_column_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_mask_clause("cat.s.fn USING COLUMNS (b-ad)")
+
+    def test_injection_token_raises(self):
+        with self.assertRaisesRegex(ValueError, "disallowed token"):
+            validate_column_mask_clause("cat.s.fn; DROP TABLE x")
+
+    def test_too_many_name_parts_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_mask_clause("a.b.c.d USING COLUMNS (x)")
+
+    def test_non_string_raises(self):
+        with self.assertRaisesRegex(ValueError, "must be a string"):
+            validate_column_mask_clause(123)
+
+    def test_unparseable_clause_shape_raises(self):
+        # Multiple bare tokens with no USING COLUMNS -> no regex match.
+        with self.assertRaisesRegex(ValueError, "not a valid mask clause"):
+            validate_column_mask_clause("cat.s.fn extra tokens")
+
+
+class ValidateColumnPolicyDictTests(unittest.TestCase):
+    def test_comments_dict_and_json_string(self):
+        self.assertEqual(
+            validate_column_comments({"ssn": "the ssn"}), {"ssn": "the ssn"}
+        )
+        self.assertEqual(
+            validate_column_comments('{"ssn": "the ssn"}'), {"ssn": "the ssn"}
+        )
+
+    def test_masks_dict_ok(self):
+        d = {"ssn": "cat.s.f USING COLUMNS (region)"}
+        self.assertEqual(validate_column_masks(d), d)
+
+    def test_none_returns_empty(self):
+        self.assertEqual(validate_column_masks(None), {})
+        self.assertEqual(validate_column_comments(""), {})
+
+    def test_phantom_none_values_dropped(self):
+        # spark.read.json schema unification can surface columns from OTHER
+        # rows with a None value; those are not this row's policies.
+        self.assertEqual(
+            validate_column_masks({"ssn": "cat.s.f", "email": None}),
+            {"ssn": "cat.s.f"},
+        )
+
+    def test_bad_column_key_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_comments({"bad-col": "x"})
+
+    def test_non_dict_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_masks("not json at all {")
+
+    def test_json_parses_to_non_dict_raises(self):
+        # Valid JSON but not an object -> distinct error branch.
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            validate_column_masks("[1, 2, 3]")
+
+    def test_bad_mask_value_raises(self):
+        with self.assertRaises(ValueError):
+            validate_column_masks({"ssn": "cat.s.f; DROP TABLE x"})
+
+    def test_empty_mask_value_dropped(self):
+        # An empty mask value would render an invalid bare ``MASK`` clause, so
+        # it is dropped before it can reach the renderer. Non-empty masks in
+        # the same map survive.
+        self.assertEqual(
+            validate_column_masks({"ssn": "", "email": "cat.s.f"}),
+            {"email": "cat.s.f"},
+        )
+        # A map of only empty masks collapses to an empty (but valid) policy.
+        self.assertEqual(validate_column_masks({"ssn": ""}), {})
+
+    def test_empty_comment_value_kept(self):
+        # Empty comments render valid ``COMMENT ''`` DDL, so unlike masks they
+        # are NOT dropped — the field is retained.
+        self.assertEqual(
+            validate_column_comments({"ssn": ""}), {"ssn": ""}
+        )
 
 
 if __name__ == "__main__":

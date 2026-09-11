@@ -25,11 +25,18 @@ flowing into the DLT pipeline and failing there.
 from __future__ import annotations
 
 import ast
+import json
 import re
 import sys
 from typing import Optional
 
 _REGULAR_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# A ``sequence_by`` entry containing a parenthesis or embedded whitespace is
+# an expression (function call / cast / arithmetic), not a bare column name.
+# ``validate_sequence_by`` uses this to reject expressions with a clear message
+# (a bare / dotted column reference matches neither).
+_SEQUENCE_EXPRESSION_RE = re.compile(r"[()\s]")
 
 _MAX_IDENT_LEN = 255
 
@@ -297,6 +304,16 @@ def validate_sequence_by(value, *, kind: str = "sequence_by") -> str:
     dot-segment of each comma-entry must be a regular identifier —
     that's exactly what the runtime's ``struct(...)`` split and DLT's
     column resolution can handle. Returns ``value`` unchanged.
+
+    Bare-column-only contract: each comma-entry is passed straight to
+    ``struct(*cols)`` at apply time as a column *name*, and the same list
+    is used to derive the SCD2 ``__START_AT`` / ``__END_AT`` type
+    (:func:`parse_sequence_by_columns`). Expression-valued sequence_by —
+    ``coalesce(a, b)``, ``cast(x as decimal(10,2))``, arithmetic, etc. —
+    is therefore rejected: ``struct()`` would treat the whole string as a
+    column name, and there is no source ``StructField`` to copy the type
+    from. Function calls / casts are caught here with a targeted message
+    rather than the generic per-segment "not a valid identifier" error.
     """
     if not isinstance(value, str) or not value.strip():
         raise ValueError(
@@ -311,12 +328,80 @@ def validate_sequence_by(value, *, kind: str = "sequence_by") -> str:
                 f"comma-separated list of column names, e.g. "
                 f"'event_ts,sequence_id'"
             )
+        # Parentheses or embedded whitespace mean this entry is an
+        # expression (a function call / cast / arithmetic sub-expression),
+        # not a bare column reference. Reject it with a clear, actionable
+        # message before the per-segment identifier check turns it into a
+        # cryptic "not a valid identifier" error. Dotted references like
+        # ``_metadata.file_path`` have neither and still pass.
+        if _SEQUENCE_EXPRESSION_RE.search(entry):
+            raise ValueError(
+                f"{kind} {value!r} looks like an expression (offending "
+                f"entry {entry!r}); {kind} must be bare column name(s), "
+                f"optionally comma-separated (e.g. 'event_ts' or "
+                f"'event_ts,sequence_id'). Each entry is passed to "
+                f"struct(...) as a column name, so expressions such as "
+                f"coalesce(...), cast(... as ...) or arithmetic are not "
+                f"supported."
+            )
         # No max_parts cap: nested struct fields can be arbitrarily deep.
         for i, part in enumerate(entry.split(".")):
             validate_uc_identifier(
                 part, kind=f"segment {i + 1} of {kind} column {entry!r}"
             )
     return value
+
+
+def parse_sequence_by_columns(value, *, kind: str = "sequence_by") -> list:
+    """Validate ``value`` and return its bare column names as a list.
+
+    Single source of truth for turning a ``sequence_by`` spec string into
+    the column list consumed BOTH by the apply-time ``struct(*cols)`` and by
+    the SCD2 ``__START_AT`` / ``__END_AT`` type derivation in
+    ``dataflow_pipeline.py``. Deriving the declared system-column type from
+    the very same list the ``struct()`` is built from is what keeps a
+    composite ``sequence_by`` ("ts,id") from declaring a scalar type while
+    DLT materialises a ``struct<ts,id>``.
+
+    Runs :func:`validate_sequence_by` first, so an expression / empty entry
+    is rejected with an actionable error before any split is trusted.
+    """
+    validate_sequence_by(value, kind=kind)
+    return [entry.strip() for entry in value.split(",")]
+
+
+def validate_snapshot_version_type(value, *, kind: str = "snapshot_version_type") -> str:
+    """Validate a snapshot version type expressed as a Spark/DDL type string.
+
+    ``apply_changes_from_snapshot`` has no ``sequence_by``; its DLT-managed
+    ``__START_AT`` / ``__END_AT`` columns are typed to the snapshot *version*,
+    produced at runtime by the ``next_snapshot_and_version`` callable or the
+    Delta source. That type cannot be introspected safely at graph-build time
+    (calling the callback does I/O / has side effects, and return annotations
+    are unreliable), so it must be declared explicitly as a canonical type
+    string. This parses the declared value to a real Spark ``DataType`` —
+    rejecting garbage — and returns its canonical ``simpleString``.
+
+    Requires an active Spark session (onboarding runs on a cluster). The
+    pyspark import is deferred so importing this module stays Spark-free.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"{kind} must be a non-empty Spark/DDL type string, got "
+            f"{type(value).__name__}: {value!r}"
+        )
+    # Deferred import: keeps this module import-light and Spark-free for the
+    # pure-Python identifier validators; the parser needs the JVM.
+    from pyspark.sql.types import _parse_datatype_string
+    try:
+        data_type = _parse_datatype_string(value)
+    except Exception as exc:  # ParseException and friends live in the JVM bridge
+        raise ValueError(
+            f"{kind}={value!r} is not a valid Spark/DDL type string. Use a "
+            f"canonical type such as 'long', 'bigint' or 'timestamp'. "
+            f"Parse error: {exc}"
+        ) from exc
+    return data_type.simpleString()
 
 
 # SQL fragments (e.g. an optional WHERE clause on the App's Metadata
@@ -410,6 +495,148 @@ def validate_sql_where_clause(value, *, kind: str = "where_clause") -> str:
             f"operations and DDL / DML are not."
         )
     return value
+
+
+_MAX_COLUMN_COMMENT_LEN = 1000
+
+# Matches the leading UC function name of a mask clause and, optionally, a
+# trailing ``USING COLUMNS (col, ...)`` list (case-insensitive). The function
+# name is everything up to the first whitespace or ``(``; the USING COLUMNS
+# group is captured separately so the column list can be validated.
+_MASK_CLAUSE_RE = re.compile(
+    r"^\s*(?P<func>[^\s(]+)\s*(?:USING\s+COLUMNS\s*\((?P<cols>[^)]*)\))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def validate_column_comment(value, *, kind: str = "column_comment") -> str:
+    """Validate a column comment string; return it unchanged on success.
+
+    Column comments are emitted as SQL string literals (``COMMENT '...'``)
+    with embedded backslashes and single quotes escaped by
+    :meth:`DataflowSpecUtils.build_schema_ddl` (backslashes first, so ``\\'``
+    cannot terminate the literal), so the comment is *data*, not
+    code — the dangerous-keyword denylist that guards WHERE clauses does not
+    apply (a comment may legitimately contain words like "select"). We only
+    enforce type, a length bound, and the absence of control characters /
+    newlines that would corrupt the rendered DDL.
+    """
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{kind} must be a string, got {type(value).__name__}: {value!r}"
+        )
+    if len(value) > _MAX_COLUMN_COMMENT_LEN:
+        raise ValueError(
+            f"{kind} is {len(value)} characters; maximum allowed is "
+            f"{_MAX_COLUMN_COMMENT_LEN}"
+        )
+    if any(ord(ch) < 0x20 for ch in value):
+        raise ValueError(
+            f"{kind} contains control characters (e.g. newlines/tabs), which "
+            f"are not permitted in a column comment."
+        )
+    return value
+
+
+def validate_column_mask_clause(value, *, kind: str = "column_mask") -> str:
+    """Validate a column mask clause; return it unchanged on success.
+
+    A mask clause is spliced verbatim after ``MASK`` into a DDL-string schema
+    (an unparameterisable position), so it is validated strictly:
+
+    1. the leading UC function name must pass :func:`validate_uc_full_name`
+       (1–3 dotted regular identifiers);
+    2. any ``USING COLUMNS (...)`` list must pass
+       :func:`validate_uc_column_list`;
+    3. the whole clause is run through the same dangerous-token / keyword
+       denylist as :func:`validate_sql_where_clause` to block ``;``, comment
+       markers, identifier delimiters and DDL/DML.
+
+    Canonical form: ``cat.schema.mask_fn USING COLUMNS (region, tier)`` or a
+    bare ``cat.schema.mask_fn``.
+    """
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{kind} must be a string, got {type(value).__name__}: {value!r}"
+        )
+    # Reuse the WHERE-clause guard for statement-separation / comment / DDL
+    # escape tokens and keywords (also enforces the length bound).
+    validate_sql_where_clause(value, kind=kind)
+    match = _MASK_CLAUSE_RE.match(value)
+    if not match:
+        raise ValueError(
+            f"{kind} {value!r} is not a valid mask clause. Expected "
+            f"'<catalog.schema.function> [USING COLUMNS (col, ...)]'."
+        )
+    validate_uc_full_name(match.group("func"), kind=f"{kind} function name")
+    cols = match.group("cols")
+    if cols is not None:
+        validate_uc_column_list(cols, kind=f"{kind} USING COLUMNS list")
+    return value
+
+
+def _validate_column_policy_dict(
+    value, per_value_validator, *, kind, drop_empty_values=False
+):
+    """Shared validator for the JSON-dict column-policy onboarding fields.
+
+    Accepts a ``dict`` (already parsed from the onboarding row) or a JSON
+    string, validates each key as a UC identifier and each value with
+    ``per_value_validator``, and returns the parsed dict. ``None`` / empty
+    returns ``{}`` so optional fields don't trip pre-flight.
+
+    When ``drop_empty_values`` is set, entries whose value is empty (``""``
+    or whitespace) are dropped after validation. Masks use this: an empty
+    mask value would render an invalid bare ``MASK`` clause, so it is not a
+    policy at all and must not survive to the renderer.
+    """
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{kind} must be a JSON object, could not parse: {exc}"
+            ) from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{kind} must be a JSON object keyed by column name, got "
+            f"{type(value).__name__}: {value!r}"
+        )
+    # ``spark.read.json`` unifies nested-object schemas across all onboarding
+    # rows, so a row can surface phantom keys (contributed by other rows)
+    # whose value is ``None``. Drop those — they are not policies for THIS
+    # row — and validate only the entries the operator actually set.
+    value = {column: entry for column, entry in value.items() if entry is not None}
+    validated = {}
+    for column, entry in value.items():
+        validate_uc_identifier(column, kind=f"{kind} column name")
+        per_value_validator(entry, kind=f"{kind} for column {column!r}")
+        if drop_empty_values and isinstance(entry, str) and entry.strip() == "":
+            continue
+        validated[column] = entry
+    return validated
+
+
+def validate_column_comments(value, *, kind: str = "column_comments") -> dict:
+    """Validate the ``*_column_comments`` onboarding field (a dict / JSON
+    object of ``{column: comment}``). Returns the parsed dict."""
+    return _validate_column_policy_dict(
+        value, validate_column_comment, kind=kind
+    )
+
+
+def validate_column_masks(value, *, kind: str = "column_masks") -> dict:
+    """Validate the ``*_column_masks`` onboarding field (a dict / JSON object
+    of ``{column: mask_clause}``). Returns the parsed dict."""
+    return _validate_column_policy_dict(
+        value, validate_column_mask_clause, kind=kind, drop_empty_values=True
+    )
 
 
 def _format_prompt_error(message: str) -> str:

@@ -6,14 +6,138 @@ import ast
 from pyspark import pipelines as dp
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import expr, struct
-from pyspark.sql.types import StructType, StructField
+from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType
+from pyspark.sql.utils import AnalysisException
 from databricks.labs.sdp_meta.dataflow_spec import BronzeDataflowSpec, SilverDataflowSpec, DataflowSpecUtils
 from databricks.labs.sdp_meta.pipeline_writers import AppendFlowWriter, DLTSinkWriter
 from databricks.labs.sdp_meta.__about__ import __version__
 from databricks.labs.sdp_meta.pipeline_readers import PipelineReaders
+from databricks.labs.sdp_meta.identifiers import parse_sequence_by_columns
 
 logger = logging.getLogger('databricks.labs.sdp_meta')
 logger.setLevel(logging.INFO)
+
+
+def _as_plain_dict(obj):
+    """Coerce a Spark map / Row / dict-like into a plain ``dict`` ({} on None)."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    try:
+        return dict(obj)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _file_metadata_struct():
+    """The standard Spark file-source ``_metadata`` struct.
+
+    Used to type the autoloader metadata column (and any ``select_metadata_cols``
+    that project one of its fields) when augmenting a bronze declared schema
+    with the columns the reader injects into the materialised target.
+    """
+    return StructType([
+        StructField("file_path", StringType(), True),
+        StructField("file_name", StringType(), True),
+        StructField("file_size", LongType(), True),
+        StructField("file_block_start", LongType(), True),
+        StructField("file_block_length", LongType(), True),
+        StructField("file_modification_time", TimestampType(), True),
+    ])
+
+
+def augment_bronze_schema_with_reader_columns(bronze_spec, declared_schema):
+    """Return ``declared_schema`` augmented with the columns the bronze reader
+    injects into the *materialised* bronze target table.
+
+    A bronze table's on-disk schema is the declared source schema
+    (``source_schema_path``) PLUS columns the reader/pipeline adds — so a
+    downstream consumer that only has the declared schema (a combined-run silver
+    transform, or the bronze column-policy DDL for issue #2) cannot resolve
+    against the true target shape. This helper reproduces those additions,
+    mirroring :class:`PipelineReaders`:
+
+      * ``cloudFiles`` sources gain the rescued-data column — name from the
+        ``cloudFiles.rescuedDataColumn`` / ``rescuedDataColumn`` reader option,
+        default ``_rescued_data`` — as a ``StringType``.
+      * When ``source_details['source_metadata']`` enables
+        ``include_autoloader_metadata_column``, the file-metadata column (custom
+        ``autoloader_metadata_col_name`` or ``source_metadata``) is added as the
+        standard file-metadata struct. Any ``select_metadata_cols`` are added
+        too (typed from the ``_metadata`` struct when the expression projects one
+        of its fields, else ``StringType``).
+
+    Columns already present in ``declared_schema`` are never duplicated. Returns
+    ``None`` unchanged when ``declared_schema`` is ``None``. This function is
+    deliberately module-level and reusable — issue #2 (bronze column policies)
+    needs the same reader-injected-column augmentation.
+    """
+    if declared_schema is None:
+        return None
+    fields = list(declared_schema.fields)
+    existing = {f.name for f in fields}
+
+    def _add(name, dtype):
+        if name and name not in existing:
+            fields.append(StructField(name, dtype, True))
+            existing.add(name)
+
+    source_format = (getattr(bronze_spec, "sourceFormat", None) or "").lower()
+    reader_opts = _as_plain_dict(getattr(bronze_spec, "readerConfigOptions", None))
+    source_details = _as_plain_dict(getattr(bronze_spec, "sourceDetails", None))
+
+    if source_format == "cloudfiles":
+        rescued = (
+            reader_opts.get("cloudFiles.rescuedDataColumn")
+            or reader_opts.get("rescuedDataColumn")
+            or "_rescued_data"
+        )
+        _add(rescued, StringType())
+
+        source_metadata_raw = source_details.get("source_metadata")
+        if source_metadata_raw:
+            try:
+                meta = (
+                    json.loads(source_metadata_raw)
+                    if isinstance(source_metadata_raw, str)
+                    else _as_plain_dict(source_metadata_raw)
+                )
+            except (ValueError, TypeError):
+                meta = {}
+            file_meta_struct = _file_metadata_struct()
+            subfield_types = {f.name: f.dataType for f in file_meta_struct.fields}
+            # Mirror ``PipelineReaders.add_cloudfiles_metadata`` EXACTLY, both in
+            # column ORDER and in false-flag handling:
+            #   * ``selectExpr("*", "_metadata")`` adds the ``_metadata`` struct
+            #     FIRST (right after the reader's ``_rescued_data``), then the
+            #     ``select_metadata_cols`` projections are appended — so the
+            #     struct column precedes the projected columns in the target.
+            #   * ``_metadata`` is only DROPPED when the
+            #     ``include_autoloader_metadata_column`` key is ABSENT. When the
+            #     key is present-and-false the reader keeps it as ``_metadata``;
+            #     present-and-true renames it (custom name, or ``source_metadata``).
+            if "include_autoloader_metadata_column" in meta:
+                flag = str(meta.get("include_autoloader_metadata_column", "")).lower() == "true"
+                if flag and "autoloader_metadata_col_name" in meta:
+                    # Reader renames ``_metadata`` -> custom name (a custom name
+                    # equal to ``_metadata`` is a no-op — same column name here).
+                    meta_col = meta["autoloader_metadata_col_name"]
+                elif flag:
+                    meta_col = "source_metadata"
+                else:
+                    # present-and-false: reader keeps the struct as ``_metadata``.
+                    meta_col = "_metadata"
+                _add(meta_col, file_meta_struct)
+            # ``select_metadata_cols`` are projected regardless of the
+            # include-metadata flag, and always AFTER the ``_metadata`` column.
+            for new_col, source_expr in (_as_plain_dict(meta.get("select_metadata_cols"))).items():
+                dtype = StringType()
+                if isinstance(source_expr, str) and source_expr.startswith("_metadata."):
+                    dtype = subfield_types.get(source_expr.split(".", 1)[1], StringType())
+                _add(new_col, dtype)
+
+    return StructType(fields)
 
 
 class DataflowPipeline:
@@ -28,13 +152,33 @@ class DataflowPipeline:
 
     def __init__(self, spark, dataflow_spec, view_name, view_name_quarantine=None,
                  custom_transform_func: Optional[Callable] = None,
-                 next_snapshot_and_version: Optional[Callable] = None):
-        """Initialize Constructor."""
+                 next_snapshot_and_version: Optional[Callable] = None,
+                 source_schema_map: Optional[dict] = None,
+                 combined_run: bool = False):
+        """Initialize Constructor.
+
+        ``source_schema_map`` maps an upstream source table's fully-qualified
+        name to its (reader-augmented) bronze target schema — a ``StructType``,
+        or a StructType-JSON string/dict. It is populated by
+        :meth:`invoke_dlt_pipeline` for the combined ``bronze_silver`` topology
+        so a silver spec can derive its schema from the bronze spec's declared
+        schema in-process — without reading the not-yet-materialised bronze
+        table (issue #1).
+
+        ``combined_run`` is ``True`` only for the silver flow of a combined
+        ``bronze_silver`` run. When set, silver column-policy schema resolution
+        that cannot be satisfied from ``source_schema_map`` FAILS FAST with an
+        actionable error naming the split-pipeline workaround, instead of
+        falling back to a live bronze-table read that would raise the opaque
+        ``TABLE_OR_VIEW_NOT_FOUND`` (the bronze table does not exist yet).
+        """
         logger.info(
             f"""dataflowSpec={dataflow_spec} ,
                 view_name={view_name},
                 view_name_quarantine={view_name_quarantine}"""
         )
+        self.source_schema_map = source_schema_map or {}
+        self.combined_run = combined_run
         if isinstance(dataflow_spec, BronzeDataflowSpec) or isinstance(dataflow_spec, SilverDataflowSpec):
             self.__initialize_dataflow_pipeline(
                 spark, dataflow_spec, view_name, view_name_quarantine, custom_transform_func, next_snapshot_and_version
@@ -189,6 +333,93 @@ class DataflowPipeline:
         if not self.uc_enabled:
             return None
         return getattr(self.dataflowSpec, "quarantineRowFilter", None)
+
+    def _get_column_comments(self):
+        """Return the column-comment map (``{column: text}``) or ``None``.
+
+        Comments are NOT a UC-only feature — they annotate any Delta table —
+        so this is not gated on ``self.uc_enabled`` (unlike masks / row
+        filters). Stored as a JSON string on the spec; parsed here.
+        """
+        raw = getattr(self.dataflowSpec, "columnComments", None)
+        if not raw:
+            return None
+        return json.loads(raw)
+
+    def _get_column_masks(self):
+        """Return the column-mask map (``{column: mask_clause}``) or ``None``.
+
+        Column masks are a Unity Catalog feature (like row filters), so they
+        are silently dropped on non-UC pipelines. Stored as a JSON string on
+        the spec; parsed here.
+        """
+        if not self.uc_enabled:
+            return None
+        raw = getattr(self.dataflowSpec, "columnMasks", None)
+        if not raw:
+            return None
+        return json.loads(raw)
+
+    def _apply_column_policies(self, struct_schema):
+        """Resolve the ``schema=`` argument for a DLT table creation call,
+        splicing UC column comments / masks into a DDL-string schema when set.
+
+        Returns:
+            * the original ``struct_schema`` unchanged (``StructType`` or
+              ``None``) when no comments/masks are configured — zero behaviour
+              change for pipelines that don't use the feature;
+            * a DDL string (built by
+              :meth:`DataflowSpecUtils.build_schema_ddl`) when comments/masks
+              are set and a schema is available.
+
+        Raises:
+            ValueError: if masks are configured but no schema is available to
+                attach them to (e.g. a bronze table with an inferred schema).
+                Masks fail closed — see ``build_schema_ddl``.
+        """
+        comments = self._get_column_comments()
+        masks = self._get_column_masks()
+        if not comments and not masks:
+            return struct_schema
+        if struct_schema is None:
+            if masks:
+                raise ValueError(
+                    "column_masks are configured for "
+                    f"{self._get_target_table_name()} but no schema is "
+                    "available to attach them to. Column masks require a "
+                    "declared schema (set the bronze source schema, or use "
+                    "them on a silver table whose schema is derived from its "
+                    "transform)."
+                )
+            logger.warning(
+                "column_comments are configured for %s but no schema is "
+                "available to attach them to; skipping comments.",
+                self._get_target_table_name(),
+            )
+            return None
+        ddl = DataflowSpecUtils.build_schema_ddl(struct_schema, comments, masks)
+        return ddl if ddl is not None else struct_schema
+
+    def _resolve_policy_schema(self):
+        """Materialise the table's StructType for column-policy rendering,
+        only when comments/masks are actually configured (avoids the cost of
+        ``get_silver_schema`` when the feature is unused).
+
+        Returns ``None`` when no policies are set, or when the schema can't be
+        determined (bronze without a declared schema).
+        """
+        if not self._get_column_comments() and not self._get_column_masks():
+            return None
+        if isinstance(self.dataflowSpec, SilverDataflowSpec):
+            # Silver derives its schema from the transform; cache it on the
+            # first (and only) production use of get_silver_schema().
+            if self.silver_schema is None:
+                self.silver_schema = self.get_silver_schema()
+            return self.silver_schema
+        # Bronze: schema is known only when a schema_json was supplied.
+        if self.schema_json:
+            return StructType.fromJson(self.schema_json)
+        return None
 
     def is_create_view(self):
         """Determine if a view should be created based on source details and snapshot configuration.
@@ -392,6 +623,24 @@ class DataflowPipeline:
             else False
         )
 
+        # Resolve the column-policy schema (``None`` unless comments/masks are
+        # configured — the feature gate). On the standard bronze write path DLT
+        # infers the query schema, which includes the reader-injected columns
+        # (``_rescued_data`` from ``cloudFiles.rescuedDataColumn`` and the
+        # autoloader metadata columns). The declared ``source_schema_path`` does
+        # NOT list those, so forcing the declared schema alone would fail table
+        # creation with a schema-incompatibility error (issue #2). Augment the
+        # policy schema with the SAME reader columns
+        # ``PipelineReaders.add_cloudfiles_metadata`` injects so the explicit
+        # schema matches DLT's inferred query schema. Strictly behind the
+        # policies-configured gate (``struct_schema is None`` when unused) and
+        # only for bronze — silver derives its schema from the transform.
+        struct_schema = self._resolve_policy_schema()
+        if is_bronze and struct_schema is not None:
+            struct_schema = augment_bronze_schema_with_reader_columns(
+                self.dataflowSpec, struct_schema
+            )
+
         dp.table(
             self.write_to_delta,
             name=f"{target_table}",
@@ -402,10 +651,18 @@ class DataflowPipeline:
             path=target_path,
             comment=comment,
             row_filter=self._get_row_filter(),
+            schema=self._apply_column_policies(struct_schema),
         )
 
     def write_layer_table(self):
         """Write Bronze or Silver tables using unified logic."""
+        # Materialise the derived silver schema up-front when UC column
+        # comments/masks are configured, so every downstream path (standard,
+        # DQE, CDC apply-changes) can render them into a DDL-string schema —
+        # in particular ``modify_schema_for_cdc_changes`` reads
+        # ``self.silver_schema``. No-op (and no ``get_silver_schema`` cost)
+        # when the feature is unused.
+        self._resolve_policy_schema()
         is_bronze = isinstance(self.dataflowSpec, BronzeDataflowSpec)
         # Handle special cases first
         if is_bronze:
@@ -490,8 +747,193 @@ class DataflowPipeline:
             input_df = self.custom_transform_func(input_df, self.dataflowSpec)
         return input_df
 
+    def _get_inprocess_source_schema(self, source_fqn):
+        """Return the upstream source's (reader-augmented) bronze target schema
+        as a ``StructType`` when it was threaded in-process via
+        ``source_schema_map`` (combined ``bronze_silver`` runs), else ``None``.
+
+        This lets ``get_silver_schema`` derive the silver schema from the
+        bronze dataflowspec's declared schema instead of a live
+        ``spark.readStream.table(<bronze fqn>)`` — the bronze table is produced
+        in the SAME run and does not exist in UC at graph-construction time, so
+        a physical read raises ``TABLE_OR_VIEW_NOT_FOUND`` (issue #1). Accepts a
+        ``StructType`` (as built by ``_build_bronze_target_schema_map``) or a
+        StructType-JSON string / dict (as tests and hand-built maps may supply).
+        """
+        schema_map = getattr(self, "source_schema_map", None)
+        if not schema_map or not source_fqn:
+            return None
+        schema = schema_map.get(source_fqn)
+        if schema is None:
+            return None
+        if isinstance(schema, StructType):
+            return schema
+        if isinstance(schema, str):
+            schema = json.loads(schema)
+        if isinstance(schema, dict):
+            return StructType.fromJson(schema)
+        return None
+
+    @staticmethod
+    def _flow_source_fqn(source_details):
+        """Build a multi-source CDC flow's source FQN from its
+        ``source_catalog`` / ``source_database`` / ``source_table`` keys (the
+        naming ``PipelineReaders.read_dlt_delta`` uses), matching how
+        ``_build_bronze_target_schema_map`` keys bronze targets. Returns
+        ``None`` when the flow source is not a catalog/db.table (e.g. a
+        cloudFiles path)."""
+        sd = _as_plain_dict(source_details)
+        db = sd.get("source_database")
+        table = sd.get("source_table")
+        if not db or not table:
+            return None
+        catalog = sd.get("source_catalog")
+        catalog_prefix = f"{catalog}." if catalog else ''
+        return f"{catalog_prefix}{db}.{table}"
+
+    def _combined_topology_schema_error(self, source_label):
+        """Actionable error for a combined-run silver policy schema that cannot
+        be resolved in-process (schemaless bronze, or a non-bronze source)."""
+        return (
+            f"Silver column policies (columnComments/columnMasks) on "
+            f"{self._get_target_table_name()} need the upstream schema at "
+            f"graph-construction time, but the source '{source_label}' has no "
+            f"declared schema available in-process during this combined "
+            f"'bronze_silver' run (the bronze table is produced in the same run "
+            f"and does not exist yet). Declare the bronze source schema "
+            f"(source_schema_path) for that source, or run bronze and silver as "
+            f"separate pipelines (the split topology, which reads the "
+            f"already-materialised bronze table)."
+        )
+
+    def _derive_schema_from_struct(self, source_struct, select_exp, where_clause, source_label):
+        """Apply a silver ``select_exp`` / ``where_clause`` to an EMPTY frame of
+        ``source_struct`` and return the resulting schema — deriving the silver
+        schema in-process with no physical read (issue #1). A referenced column
+        missing from the in-process bronze schema (e.g. added by a bronze
+        ``custom_transform_func``, or a reader column not captured by the
+        declared schema) surfaces as an ``AnalysisException`` here, which we
+        translate into an actionable combined-topology error rather than letting
+        it fall through to an opaque failure."""
+        df = self.spark.createDataFrame([], source_struct)
+        try:
+            if select_exp:
+                df = df.selectExpr(*select_exp)
+            df = self.__apply_where_clause(where_clause, df)
+        except AnalysisException as ae:
+            raise ValueError(
+                f"Silver column policies on {self._get_target_table_name()} in a "
+                f"combined 'bronze_silver' run: the silver transform references a "
+                f"column not present in the in-process bronze schema for source "
+                f"'{source_label}'. This happens when the column is added by a "
+                f"bronze custom_transform_func or a reader option not reflected "
+                f"in the declared bronze schema. Declare the column in the bronze "
+                f"source schema, or run bronze and silver as separate pipelines "
+                f"(split topology). Original error: {ae}"
+            ) from ae
+        return df.schema
+
+    def _read_flow_source_df(self, flow):
+        """Live-read one multi-source CDC flow's source into a DataFrame (split
+        topology only — the source table/files already exist). Mirrors the
+        reader dispatch in ``read_cdc_flows``."""
+        pipeline_reader = PipelineReaders(
+            self.spark,
+            flow.source_format,
+            flow.source_details,
+            flow.reader_options or {},
+            None,
+        )
+        sf = flow.source_format.lower()
+        if sf == "cloudfiles":
+            return pipeline_reader.read_dlt_cloud_files()
+        elif sf == "delta":
+            return pipeline_reader.read_dlt_delta()
+        elif sf in ("kafka", "eventhub"):
+            return pipeline_reader.read_kafka()
+        raise Exception(
+            f"cdcApplyChangesFlows.flows[{flow.name}].source_format"
+            f"={flow.source_format!r} is not supported by the runtime; "
+            f"allowed: cloudFiles, delta, kafka, eventhub"
+        )
+
+    def _merge_flow_schemas(self, per_flow_schemas):
+        """Verify every multi-source flow projects the same (name, type) columns
+        and return the merged schema. All flows land in ONE streaming table, so
+        their post-transform schemas must be compatible; a mismatch is a config
+        error surfaced clearly rather than a confusing DLT failure downstream.
+
+        Nullability is merged by SAFE WIDENING: a field is nullable in the
+        result when ANY flow projects it as nullable. This is order-independent
+        (the flow list order never changes the result) and never emits a
+        spurious ``NOT NULL`` — the policy DDL adds ``NOT NULL`` from
+        ``field.nullable`` (dataflow_spec.build_schema_ddl), so a column is
+        constrained ``NOT NULL`` only when every flow guarantees it is
+        non-null."""
+        if not per_flow_schemas:
+            return None
+        ref_name, ref_schema = per_flow_schemas[0]
+        ref_fields = [(f.name, f.dataType) for f in ref_schema.fields]
+        # nullable[i] widened across flows (any-nullable -> nullable).
+        nullable = [f.nullable for f in ref_schema.fields]
+        for name, schema in per_flow_schemas[1:]:
+            fields = [(f.name, f.dataType) for f in schema.fields]
+            if fields != ref_fields:
+                raise ValueError(
+                    f"Multi-source AUTO CDC flows for {self._get_target_table_name()} "
+                    f"produce incompatible schemas after per-flow "
+                    f"select_exp/where_clause: flow '{ref_name}' yields "
+                    f"{ref_fields} but flow '{name}' yields {fields}. Every flow "
+                    f"landing in one streaming table must project the same "
+                    f"columns and types."
+                )
+            for i, f in enumerate(schema.fields):
+                nullable[i] = nullable[i] or f.nullable
+        return StructType([
+            StructField(f.name, f.dataType, nullable[i], f.metadata)
+            for i, f in enumerate(ref_schema.fields)
+        ])
+
+    def _get_silver_schema_from_cdc_flows(self):
+        """Derive the target schema for a multi-source AUTO CDC silver spec
+        (issue #294). Pure multi-source silver specs carry empty
+        ``sourceDetails`` and null ``selectExp`` — their real sources live in
+        ``cdcApplyChangesFlows`` — so single-source ``get_silver_schema`` would
+        build the FQN ``"."`` and fail. Resolve EACH flow's source against the
+        in-process bronze schema map (combined run) or a live read (split
+        topology), apply that flow's ``select_exp`` / ``where_clause``, and merge
+        the compatible per-flow schemas into the shared target schema (issue
+        #1 / BLOCKING: multi-source combined policy support)."""
+        group = self.cdcApplyChangesFlows
+        per_flow_schemas = []
+        for flow in group.flows:
+            fqn = self._flow_source_fqn(flow.source_details)
+            in_proc = self._get_inprocess_source_schema(fqn)
+            if in_proc is not None:
+                schema = self._derive_schema_from_struct(
+                    in_proc, flow.select_exp, flow.where_clause, fqn
+                )
+            elif self.combined_run:
+                raise ValueError(self._combined_topology_schema_error(
+                    fqn or f"flow '{flow.name}' (source_format={flow.source_format})"
+                ))
+            else:
+                # Split topology: the flow's source already exists — read it.
+                df = self._read_flow_source_df(flow)
+                if flow.select_exp:
+                    df = df.selectExpr(*flow.select_exp)
+                df = self.__apply_where_clause(flow.where_clause, df)
+                schema = df.schema
+            per_flow_schemas.append((flow.name, schema))
+        return self._merge_flow_schemas(per_flow_schemas)
+
     def get_silver_schema(self):
         """Get Silver table Schema."""
+        # Multi-source AUTO CDC silver specs (issue #294) carry their real
+        # sources in ``cdcApplyChangesFlows`` (empty sourceDetails / null
+        # selectExp), so resolve them per-flow.
+        if self.cdcApplyChangesFlows:
+            return self._get_silver_schema_from_cdc_flows()
         silver_dataflow_spec: SilverDataflowSpec = self.dataflowSpec
         source_details = self._get_source_details()
         source_cl = source_details.get('catalog', None)
@@ -500,12 +942,37 @@ class DataflowPipeline:
         source_table = source_details["table"]
         select_exp = silver_dataflow_spec.selectExp
         where_clause = silver_dataflow_spec.whereClause
-        raw_delta_table_stream = self.spark.readStream.table(
-            f"{source_cl_name}{source_database}.{source_table}"
-        ).selectExpr(*select_exp) if self.uc_enabled else self.spark.readStream.load(
-            path=source_details.get("path"),
-            format="delta"
-        ).selectExpr(*select_exp)
+        source_fqn = f"{source_cl_name}{source_database}.{source_table}"
+        # In a combined ``bronze_silver`` run the upstream bronze table is
+        # produced in the SAME pipeline run and does not yet exist in UC at
+        # graph-construction time. When the bronze dataflowspec's declared
+        # schema was threaded in-process (see ``invoke_dlt_pipeline``), derive
+        # the silver schema from it — applying the same ``selectExpr`` /
+        # ``where`` transform against an empty frame — instead of issuing a live
+        # ``spark.readStream.table(<bronze fqn>)`` that would raise
+        # TABLE_OR_VIEW_NOT_FOUND. This removes the bronze→silver ordering
+        # dependency entirely (issue #1).
+        source_struct = self._get_inprocess_source_schema(source_fqn)
+        if source_struct is not None:
+            return self._derive_schema_from_struct(
+                source_struct, select_exp, where_clause, source_fqn
+            )
+        # No in-process schema. In a combined run the bronze table does not exist
+        # yet, so a live read would raise TABLE_OR_VIEW_NOT_FOUND — fail fast with
+        # an actionable message instead (schemaless bronze / non-mapped source).
+        if self.combined_run:
+            raise ValueError(self._combined_topology_schema_error(source_fqn))
+        # Split bronze-then-silver topology: the bronze table already exists,
+        # read it live, exactly as before.
+        if self.uc_enabled:
+            raw_delta_table_stream = self.spark.readStream.table(
+                source_fqn
+            ).selectExpr(*select_exp)
+        else:
+            raw_delta_table_stream = self.spark.readStream.load(
+                path=source_details.get("path"),
+                format="delta"
+            ).selectExpr(*select_exp)
         raw_delta_table_stream = self.__apply_where_clause(where_clause, raw_delta_table_stream)
         return raw_delta_table_stream.schema
 
@@ -588,7 +1055,103 @@ class DataflowPipeline:
 
     def apply_changes_from_snapshot(self):
         target_path = None if self.uc_enabled else self.dataflowSpec.targetDetails["path"]
-        self.create_streaming_table(None, target_path)
+        # Fail closed for SCD2 snapshot targets when column policies are
+        # CONFIGURED. An SCD2 table carries DLT-managed ``__START_AT`` /
+        # ``__END_AT`` system columns typed to the snapshot *version*. Unlike
+        # the regular CDC path (``modify_schema_for_cdc_changes``),
+        # ``ApplyChangesFromSnapshot`` has no ``sequence_by`` from which to
+        # derive that version dtype — it is determined at runtime by the
+        # ``next_snapshot_and_version`` return / snapshot source — so we cannot
+        # build a complete explicit schema. Emitting an explicit schema that
+        # omits those system columns can break target-table creation, and
+        # silently dropping a mask is a security regression.
+        #
+        # The check is based on whether policies are CONFIGURED, not on
+        # whether a schema was resolved: ``_resolve_policy_schema`` returns
+        # ``None`` for an inferred-schema Bronze target, so a comments-only +
+        # inferred-schema SCD2 target would otherwise slip past (comments
+        # merely warned/skipped) and the table would still be created,
+        # violating the "SCD2 snapshot with policies must raise and create no
+        # table" contract. We therefore reject BEFORE ``create_streaming_table``
+        # whenever comments and/or masks are configured for this target. SCD1
+        # snapshot targets have no such system columns and keep working; SCD2
+        # with no policies is unaffected. See docs/docs/guides/column-policies.md.
+        has_policies = bool(self._get_column_comments()) or bool(self._get_column_masks())
+        struct_schema = self._resolve_policy_schema()
+        if has_policies and str(self.applyChangesFromSnapshot.scd_type) == "2":
+            # Determine the snapshot version type for the DLT-managed
+            # __START_AT / __END_AT system columns. It is an EXPLICIT contract
+            # (declared snapshot_version_type), or LONG for the first-party
+            # Delta snapshot-source mode that contractually guarantees the
+            # Delta commit version. When neither is available we keep the
+            # original fail-closed error (below).
+            version_type = self._resolve_snapshot_version_type()
+            if version_type is not None:
+                # INJECT the system columns into the explicit schema via the
+                # SAME build-new-StructType mechanism as the regular CDC path
+                # (Fix 1): __END_AT nullable, __START_AT following the version
+                # nullability. When the policy schema is unavailable (e.g. an
+                # inferred-schema Bronze target) there is nothing to attach the
+                # policies to; fall through to the fail-closed error so masks
+                # are never silently dropped.
+                if struct_schema is not None:
+                    struct_schema = self._with_scd2_system_columns(
+                        struct_schema, version_type, start_at_nullable=True
+                    )
+                    self.create_streaming_table(struct_schema, target_path)
+                    self._create_auto_cdc_from_snapshot_flow()
+                    return
+            raise ValueError(
+                "column_comments / column_masks are not supported on an SCD2 "
+                f"apply_changes_from_snapshot target ({self._get_target_table_name()}) "
+                "without a declared snapshot_version_type. "
+                "SCD2 snapshot targets require DLT-managed __START_AT / __END_AT "
+                "system columns whose type is the snapshot version and cannot be "
+                "derived here (apply_changes_from_snapshot has no sequence_by), so "
+                "an explicit schema carrying the policies would omit them and break "
+                "target-table creation. Declare the version type via "
+                "apply_changes_from_snapshot.snapshot_version_type (e.g. 'long' or "
+                "'timestamp') AND provide a schema (Bronze source schema, or a "
+                "Silver transform-derived schema), use SCD type 1 for column "
+                "policies on a snapshot target, or apply the COMMENT / MASK with a "
+                "separate ALTER TABLE after the pipeline creates the table."
+            )
+        # Wire in the declared (Bronze ``schema_json``) / derived (Silver
+        # transform) schema so column comments/masks are applied to the
+        # snapshot-CDC target table. ``_resolve_policy_schema`` returns
+        # ``None`` when the feature is unused, so ``_apply_column_policies``
+        # (inside ``create_streaming_table``) preserves the previous
+        # ``create_streaming_table(None, ...)`` behaviour — a masks-only
+        # inferred-schema SCD1 target still fails closed via
+        # ``_apply_column_policies(None)``.
+        self.create_streaming_table(struct_schema, target_path)
+        self._create_auto_cdc_from_snapshot_flow()
+
+    def _resolve_snapshot_version_type(self):
+        """Return the SCD2 snapshot version ``DataType`` to declare, or ``None``.
+
+        Precedence:
+          1. An explicit ``snapshot_version_type`` declared on the spec — the
+             general contract. Parsed to a real Spark ``DataType`` (validated
+             at onboarding). The runtime version MUST conform to it; a mismatch
+             surfaces as an explicit create/insert failure.
+          2. ``LongType`` for the first-party Delta snapshot-source mode
+             (``snapshot_format == "delta"``), which CONTRACTUALLY guarantees
+             the version is the Delta commit version (a ``long``). We do NOT
+             infer ``LONG`` merely because a ``next_snapshot_and_version``
+             callback happens to read Delta — only this declared source mode.
+          3. ``None`` otherwise — the caller keeps the fail-closed error.
+        """
+        declared = getattr(self.applyChangesFromSnapshot, "snapshot_version_type", None)
+        if declared:
+            from pyspark.sql.types import _parse_datatype_string
+            return _parse_datatype_string(declared)
+        if self.snapshot_source_format == "delta":
+            return LongType()
+        return None
+
+    def _create_auto_cdc_from_snapshot_flow(self):
+        """Register the snapshot CDC flow against the (already created) target."""
         target_cl = self.dataflowSpec.targetDetails.get('catalog', None)
         target_db_name = self.dataflowSpec.targetDetails['database']
         target_table_name = self.dataflowSpec.targetDetails['table']
@@ -634,6 +1197,10 @@ class DataflowPipeline:
                 and self.dataflowSpec.clusterByAuto is not None
                 else False
             )
+            # Resolve the DDL-string schema carrying any UC column comments /
+            # masks once (falls back to the derived StructType / None when the
+            # feature is unused).
+            column_policy_schema = self._apply_column_policies(self._resolve_policy_schema())
 
             # Create base table with expectations
             if expect_all_dict:
@@ -648,6 +1215,7 @@ class DataflowPipeline:
                         path=target_path,
                         comment=target_comment,
                         row_filter=self._get_row_filter(),
+                        schema=column_policy_schema,
                     )
                 )
             if expect_all_or_fail_dict:
@@ -663,6 +1231,7 @@ class DataflowPipeline:
                             path=target_path,
                             comment=target_comment,
                             row_filter=self._get_row_filter(),
+                            schema=column_policy_schema,
                         )
                     )
                 else:
@@ -681,6 +1250,7 @@ class DataflowPipeline:
                             path=target_path,
                             comment=target_comment,
                             row_filter=self._get_row_filter(),
+                            schema=column_policy_schema,
                         )
                     )
                 else:
@@ -772,12 +1342,18 @@ class DataflowPipeline:
                     if isinstance(self.dataflowSpec, BronzeDataflowSpec)
                     else self.silver_schema
                 )
+            elif isinstance(self.dataflowSpec, SilverDataflowSpec):
+                # Silver has no ``schema_json`` (its schema is derived from the
+                # transform). Resolve it lazily so column comments/masks can be
+                # attached; returns ``None`` when the feature is unused, which
+                # preserves the previous "no explicit schema" behaviour.
+                struct_schema = self._resolve_policy_schema()
             target_details = self._get_target_details()
 
             append_flow_writer = AppendFlowWriter(
                 self.spark, append_flow,
                 target_details['table'],
-                struct_schema,
+                self._apply_column_policies(struct_schema),
                 self.dataflowSpec.tableProperties,
                 self.dataflowSpec.partitionColumns,
                 self.dataflowSpec.clusterBy,
@@ -792,9 +1368,23 @@ class DataflowPipeline:
         if cdc_apply_changes is None:
             raise Exception("cdcApplychanges is None! ")
 
+        # Silver has no ``schema_json`` (its schema comes from the transform),
+        # so conditioning only on ``schema_json`` previously passed ``None``
+        # here — dropping Silver comments and failing Silver masks with "no
+        # schema is available". ``_resolve_policy_schema`` materialises the
+        # derived schema on ``self.silver_schema`` ONLY when comments/masks
+        # are configured (returns ``None`` otherwise), so we pass the modified
+        # schema on the CDC path when policies are set and otherwise preserve
+        # the previous inferred-schema behaviour.
+        # Parse sequence_by ONCE here; this single list is reused for BOTH the
+        # explicit-schema derivation (modify_schema_for_cdc_changes) and the
+        # apply-time struct(*cols) below — the contract's single source of truth.
+        sequence_cols = parse_sequence_by_columns(cdc_apply_changes.sequence_by)
+
+        policy_schema = self._resolve_policy_schema()
         struct_schema = None
-        if self.schema_json:
-            struct_schema = self.modify_schema_for_cdc_changes(cdc_apply_changes)
+        if self.schema_json or policy_schema is not None:
+            struct_schema = self.modify_schema_for_cdc_changes(cdc_apply_changes, sequence_cols)
 
         target_path = None if self.uc_enabled else self.dataflowSpec.targetDetails["path"]
 
@@ -813,11 +1403,13 @@ class DataflowPipeline:
         target_table_name = self.dataflowSpec.targetDetails['table']
         target_table = self._build_table_name(target_cl, target_db_name, target_table_name)
 
-        # Handle comma-separated sequence columns using struct
-        sequence_by = cdc_apply_changes.sequence_by
-        if ',' in sequence_by:
-            sequence_cols = [col.strip() for col in sequence_by.split(',')]
-            sequence_by = struct(*sequence_cols)  # Use struct() from pyspark.sql.functions
+        # Composite sequence_by => struct(*cols); single => the bare column.
+        # ``sequence_cols`` was parsed once above and also fed to the schema
+        # derivation, so the declared __START_AT/__END_AT type matches this
+        # value exactly.
+        sequence_by = (
+            struct(*sequence_cols) if len(sequence_cols) > 1 else sequence_cols[0]
+        )
 
         dp.create_auto_cdc_flow(
             target=target_table,
@@ -874,6 +1466,10 @@ class DataflowPipeline:
         if group is None:
             raise Exception("cdcApplyChangesFlows is None! ")
 
+        # Parse sequence_by ONCE; reused for BOTH the schema derivation and the
+        # apply-time struct(*cols) below (single source of truth).
+        sequence_cols = parse_sequence_by_columns(group.sequence_by)
+
         struct_schema = None
         # Bronze derives the streaming-table schema from
         # ``self.schema_json`` if set; silver from ``self.silver_schema``.
@@ -881,7 +1477,7 @@ class DataflowPipeline:
         # ``modify_schema_for_cdc_changes`` then checks both possibilities
         # internally and returns ``None`` when no schema is available.
         if self.schema_json or self.silver_schema:
-            struct_schema = self.modify_schema_for_cdc_changes(group)
+            struct_schema = self.modify_schema_for_cdc_changes(group, sequence_cols)
 
         target_path = None if self.uc_enabled else self.dataflowSpec.targetDetails["path"]
         self.create_streaming_table(struct_schema, target_path)
@@ -890,13 +1486,14 @@ class DataflowPipeline:
         apply_as_truncates = expr(group.apply_as_truncates) if group.apply_as_truncates else None
 
         # Composite sequence_by ("ts,id") => struct(ts, id), same as the
-        # single-flow path. The first column is also what
-        # ``modify_schema_for_cdc_changes`` uses for the SCD2 timestamp
-        # dtype lookup, so the two stay aligned.
-        sequence_by = group.sequence_by
-        if ',' in sequence_by:
-            sequence_cols = [c.strip() for c in sequence_by.split(',')]
-            sequence_by = struct(*sequence_cols)
+        # single-flow path. ``sequence_cols`` (parsed once above and also fed to
+        # the schema derivation) is the single source of truth, so the declared
+        # __START_AT/__END_AT type mirrors exactly what DLT materialises here.
+        # (Previously the schema path looked up only the first column's scalar
+        # type, which did NOT match struct(ts,id).)
+        sequence_by = (
+            struct(*sequence_cols) if len(sequence_cols) > 1 else sequence_cols[0]
+        )
 
         target_table = self._get_target_table_name()
 
@@ -921,7 +1518,15 @@ class DataflowPipeline:
                 ignore_null_updates_except_column_list=group.ignore_null_updates_except_column_list,
             )
 
-    def modify_schema_for_cdc_changes(self, cdc_apply_changes):
+    def modify_schema_for_cdc_changes(self, cdc_apply_changes, sequence_cols=None):
+        """Build the explicit target schema for a CDC/SCD2 table.
+
+        ``sequence_cols`` is the ALREADY-parsed bare-column list (single source
+        of truth). The apply-time callers parse ``sequence_by`` once and pass it
+        here so the derived ``__START_AT``/``__END_AT`` type and the apply-time
+        ``struct(*cols)`` provably operate on the identical list. When called
+        directly (e.g. from tests) ``None`` means "parse it here".
+        """
         if isinstance(self.dataflowSpec, BronzeDataflowSpec) and self.schema_json is None:
             return None
         if isinstance(self.dataflowSpec, SilverDataflowSpec) and self.silver_schema is None:
@@ -936,33 +1541,124 @@ class DataflowPipeline:
         if struct_schema is None:
             return None
 
-        # Resolve the sequence-by column's dtype up front, independent of
-        # ``except_column_list``. Previously this lookup lived *inside* the
-        # ``if except_column_list:`` block, so an SCD2 table with an explicit
-        # schema but no except-list never got its __START_AT/__END_AT columns
-        # appended. The lookup uses the full (pre-prune) schema; the sequence
-        # column is never a member of except_column_list, so ordering is safe.
-        sequence_by = cdc_apply_changes.sequence_by.strip()
-        sequence_lookup_col = (
-            sequence_by if ',' not in sequence_by
-            else sequence_by.split(',', 1)[0].strip()
-        )
-        name_to_dtype = {f.name: f.dataType for f in struct_schema.fields}
-        sequenced_by_data_type = name_to_dtype.get(sequence_lookup_col)
+        # Single source of truth: reuse the caller's already-parsed bare-column
+        # list so the SCD2 system-column type and the apply-time struct(*cols)
+        # provably operate on the identical columns. Only parse here when called
+        # without one (direct/test calls). The derivation below uses the full
+        # (pre-prune) schema, so it still resolves the type even when a sequence
+        # column is itself listed in except_column_list.
+        if sequence_cols is None:
+            sequence_cols = parse_sequence_by_columns(cdc_apply_changes.sequence_by)
 
+        # Prune except_column_list off a COPY of the fields. NEVER mutate
+        # ``struct_schema`` in place: on the silver path it is
+        # ``self.silver_schema`` (shared and cached across refreshes/targets),
+        # so an in-place ``.add()`` would corrupt it for every later use.
         if cdc_apply_changes.except_column_list:
-            # Hoist per-field-invariant work out of the loop. On wide schemas
-            # (hundreds of columns) the previous O(N*M) membership check plus
-            # repeated string parsing dominated graph build time.
             except_set = set(cdc_apply_changes.except_column_list)
-            struct_schema = StructType(
-                [f for f in struct_schema.fields if f.name not in except_set]
-            )
+            pruned_fields = [f for f in struct_schema.fields if f.name not in except_set]
+        else:
+            pruned_fields = list(struct_schema.fields)
+        pruned_schema = StructType(pruned_fields)
 
-        if struct_schema and cdc_apply_changes.scd_type == "2" and sequenced_by_data_type is not None:
-            struct_schema.add(StructField("__START_AT", sequenced_by_data_type))
-            struct_schema.add(StructField("__END_AT", sequenced_by_data_type))
-        return struct_schema
+        if cdc_apply_changes.scd_type != "2":
+            return pruned_schema
+
+        # Derive the __START_AT/__END_AT type from the (pre-prune) source
+        # schema so it matches the apply-time value exactly. Dotted references
+        # are rejected here (see _derive_scd2_sequence_type). ``None`` means a
+        # plain top-level sequence column is simply absent from the schema — we
+        # skip the system columns rather than declare a wrong one (preserving
+        # the long-standing behaviour for a missing sequence column).
+        derived = self._derive_scd2_sequence_type(
+            struct_schema, sequence_cols, target_name=self._get_target_table_name()
+        )
+        if derived is None:
+            return pruned_schema
+        start_at_type, start_at_nullable = derived
+        return self._with_scd2_system_columns(
+            pruned_schema, start_at_type, start_at_nullable=start_at_nullable
+        )
+
+    @staticmethod
+    def _derive_scd2_sequence_type(struct_schema, sequence_cols, *, target_name=""):
+        """Return ``(dataType, nullable)`` for the SCD2 ``__START_AT`` column,
+        mirroring EXACTLY what the apply-time sequence expression materialises.
+
+        * 1 column -> the source ``StructField``'s ``dataType`` OBJECT copied
+          directly (not rebuilt), following its nullability. Apply time passes
+          the bare column name (a scalar reference), so DLT stamps that column's
+          own type — which may itself be a struct/array/map, whose nested
+          nullability and metadata are preserved because we reuse the very same
+          ``DataType`` object.
+        * N columns -> a ``StructType`` built from the corresponding source
+          ``StructField``s in DECLARED order (names / types / nested
+          nullability / metadata copied verbatim), because apply time wraps
+          them in ``struct(*cols)`` and Spark's ``struct()`` preserves each
+          referenced field verbatim. The struct expression itself is
+          non-nullable.
+
+        Dotted sequence references (``a.b``) are REJECTED with a clear error:
+        we must emit a COMPLETE explicit schema (comments/masks require it), but
+        a dotted path resolves against nested schema and ``struct()`` renames it
+        to the last segment, so a top-level lookup here cannot faithfully mirror
+        what DLT materialises. Silently skipping would emit a schema missing the
+        system columns and break CREATE — so we fail loudly and actionably
+        instead. ``validate_sequence_by`` still accepts dotted refs for the
+        (non-explicit-schema) SCD1 / ordering-only paths.
+
+        Returns ``None`` if a plain top-level sequence column is simply absent
+        from the schema, signalling the caller to skip the system columns
+        (long-standing behaviour for a missing sequence column).
+        """
+        dotted = [col for col in sequence_cols if "." in col]
+        if dotted:
+            raise ValueError(
+                f"SCD2 apply_changes target ({target_name}) declares a dotted "
+                f"sequence_by column {dotted!r}, which is not supported when an "
+                f"explicit schema is required (column comments/masks, or a "
+                f"declared bronze/silver schema). The DLT-managed __START_AT / "
+                f"__END_AT columns must be typed from a top-level schema field, "
+                f"but a dotted reference resolves against nested schema and is "
+                f"renamed by struct(...). Use a top-level column for sequence_by "
+                f"on an SCD2 target, or drop the explicit schema / column "
+                f"policies."
+            )
+        name_to_field = {f.name: f for f in struct_schema.fields}
+        try:
+            seq_fields = [name_to_field[col] for col in sequence_cols]
+        except KeyError:
+            return None
+        if len(seq_fields) == 1:
+            # Copy the source dataType OBJECT directly so a non-scalar sequence
+            # column keeps its nested nullability/metadata intact.
+            field = seq_fields[0]
+            return field.dataType, field.nullable
+        nested = StructType([
+            StructField(f.name, f.dataType, f.nullable, f.metadata)
+            for f in seq_fields
+        ])
+        return nested, False
+
+    @staticmethod
+    def _with_scd2_system_columns(struct_schema, start_at_type, *, start_at_nullable):
+        """Return a NEW ``StructType`` with SCD2 ``__START_AT`` / ``__END_AT``
+        appended to ``struct_schema``.
+
+        Never mutates ``struct_schema`` (it may be a shared/cached schema such
+        as ``self.silver_schema``); a fresh ``StructType`` is always built.
+        ``__END_AT`` is DELIBERATELY nullable — current/open records carry
+        ``NULL`` there — regardless of the sequence/version nullability;
+        ``__START_AT`` follows the sequence/version nullability. Shared by the
+        regular CDC path (Fix 1) and the snapshot-CDC path (Fix 2).
+        """
+        return StructType(
+            list(struct_schema.fields)
+            + [
+                StructField("__START_AT", start_at_type, start_at_nullable),
+                StructField("__END_AT", start_at_type, True),
+            ]
+        )
 
     def create_streaming_table(self, struct_schema, target_path=None):
         expect_all_dict, expect_all_or_drop_dict, expect_all_or_fail_dict = self.get_dq_expectations()
@@ -987,7 +1683,7 @@ class DataflowPipeline:
             cluster_by=DataflowSpecUtils.get_partition_cols(self.dataflowSpec.clusterBy),
             cluster_by_auto=cluster_by_auto,
             path=target_path,
-            schema=struct_schema,
+            schema=self._apply_column_policies(struct_schema),
             expect_all=expect_all_dict,
             expect_all_or_drop=expect_all_or_drop_dict,
             expect_all_or_fail=expect_all_or_fail_dict,
@@ -1061,14 +1757,65 @@ class DataflowPipeline:
                 bronze_next_snapshot_and_version
             )
             silver_dataflowspec_list = DataflowSpecUtils.get_silver_dataflow_spec(spark)
+            # Thread each bronze target's declared schema into the silver flow
+            # so silver column-policy schema resolution never depends on the
+            # bronze table already existing in UC (issue #1). In a combined run
+            # the bronze table is produced in this same run, so a live read of
+            # it at graph-construction time raises TABLE_OR_VIEW_NOT_FOUND.
+            source_schema_map = DataflowPipeline._build_bronze_target_schema_map(
+                bronze_dataflowspec_list
+            )
             DataflowPipeline._launch_dlt_flow(
                 spark, "silver", silver_dataflowspec_list, silver_custom_transform_func,
-                silver_next_snapshot_and_version
+                silver_next_snapshot_and_version, source_schema_map=source_schema_map,
+                combined_run=True
             )
 
     @staticmethod
+    def _build_bronze_target_schema_map(bronze_dataflowspec_list):
+        """Map each bronze target's fully-qualified table name to its
+        reader-augmented TARGET schema (a ``StructType``), for in-process silver
+        schema resolution during a combined ``bronze_silver`` run.
+
+        The mapped schema is the declared source schema AUGMENTED with the
+        columns the bronze reader injects into the materialised target
+        (``_rescued_data``, autoloader metadata columns — see
+        :func:`augment_bronze_schema_with_reader_columns`), so a silver
+        ``selectExp`` that references such a valid bronze-target column resolves
+        against the in-process schema exactly as it would against the physical
+        table (BLOCKING #2: mapped schema must be the TARGET schema, not the raw
+        input schema).
+
+        Keyed to match how ``get_silver_schema`` / ``_flow_source_fqn`` build
+        the silver source FQN (``catalog.database.table``, catalog omitted when
+        absent). Bronze specs with no declared schema are skipped — silver
+        schema resolution then fails fast in a combined run (there is no schema
+        to resolve against) or reads the live table in the split topology.
+        """
+        schema_map = {}
+        for spec in bronze_dataflowspec_list:
+            if not isinstance(spec, BronzeDataflowSpec):
+                continue
+            raw_schema = getattr(spec, "schema", None)
+            if not raw_schema:
+                continue
+            target_details = spec.targetDetails
+            if not target_details:
+                continue
+            declared = StructType.fromJson(
+                json.loads(raw_schema) if isinstance(raw_schema, str) else raw_schema
+            )
+            augmented = augment_bronze_schema_with_reader_columns(spec, declared)
+            catalog = target_details.get('catalog', None)
+            catalog_prefix = f"{catalog}." if catalog is not None else ''
+            key = f"{catalog_prefix}{target_details['database']}.{target_details['table']}"
+            schema_map[key] = augmented
+        return schema_map
+
+    @staticmethod
     def _launch_dlt_flow(
-        spark, layer, dataflowspec_list, custom_transform_func=None, next_snapshot_and_version: Callable = None
+        spark, layer, dataflowspec_list, custom_transform_func=None, next_snapshot_and_version: Callable = None,
+        source_schema_map=None, combined_run=False
     ):
         for dataflowSpec in dataflowspec_list:
             logger.info("Printing Dataflow Spec")
@@ -1110,7 +1857,9 @@ class DataflowPipeline:
                 target_view_name,
                 quarantine_input_view_name,
                 custom_transform_func,
-                next_snapshot_and_version
+                next_snapshot_and_version,
+                source_schema_map=source_schema_map,
+                combined_run=combined_run
             )
             dlt_data_flow.run_dlt()
 

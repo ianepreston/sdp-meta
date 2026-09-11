@@ -8,6 +8,7 @@ from typing import List
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col, lit, row_number
 from pyspark.sql.session import SparkSession
+from pyspark.sql.types import ArrayType, MapType, StructType
 from pyspark.sql.window import Window
 
 logger = logging.getLogger("sdp-meta")
@@ -83,6 +84,18 @@ class BronzeDataflowSpec:
     # :attr:`DataflowSpecUtils.additional_bronze_df_columns`.
     rowFilter: str
     quarantineRowFilter: str
+    # UC column-level governance: JSON-encoded dicts keyed by column name.
+    # ``columnComments`` -> ``{"col": "free text"}`` and ``columnMasks`` ->
+    # ``{"col": "cat.schema.fn USING COLUMNS (other_col)"}`` (a clause spliced
+    # after ``MASK``). Both are rendered into a DDL-string schema by
+    # :meth:`DataflowSpecUtils.build_schema_ddl` because DLT does not read
+    # ``StructField.metadata`` for masks. Masks are UC-only and silently
+    # dropped on non-UC pipelines via
+    # :meth:`DataflowPipeline._get_column_masks`; comments apply on any Delta
+    # table. Forward-compatible with legacy Delta dataflowspec tables via
+    # :attr:`DataflowSpecUtils.additional_bronze_df_columns`.
+    columnComments: str
+    columnMasks: str
 
 
 @dataclass
@@ -129,6 +142,13 @@ class SilverDataflowSpec:
     # :meth:`DataflowPipeline._get_quarantine_row_filter` helpers.
     rowFilter: str
     quarantineRowFilter: str
+    # UC column-level governance. See the bronze docstring above for the full
+    # rationale; the silver version is wired through the same
+    # :meth:`DataflowSpecUtils.build_schema_ddl` renderer and
+    # :meth:`DataflowPipeline._get_column_comments` /
+    # :meth:`DataflowPipeline._get_column_masks` helpers.
+    columnComments: str
+    columnMasks: str
 
 
 @dataclass
@@ -154,11 +174,25 @@ class CDCApplyChanges:
 
 @dataclass
 class ApplyChangesFromSnapshot:
-    """CDC ApplyChangesFromSnapshot structure."""
+    """CDC ApplyChangesFromSnapshot structure.
+
+    ``snapshot_version_type`` (optional) declares the Spark/DDL type of the
+    snapshot *version* that DLT stamps into the managed SCD2 ``__START_AT`` /
+    ``__END_AT`` columns. ``apply_changes_from_snapshot`` has no
+    ``sequence_by`` to derive that type from, and the runtime version comes
+    from the ``next_snapshot_and_version`` callable / Delta source, which
+    cannot be introspected safely at graph-build time. Declaring it here lets
+    column comments/masks be attached to an SCD2 snapshot target via a
+    complete explicit schema. The runtime version MUST conform to this
+    declared type; a mismatch surfaces as a create/insert failure (explicit
+    and validatable) rather than a silently wrong schema. ``None`` for legacy
+    spec rows and whenever the feature is unused.
+    """
     keys: list
     scd_type: str
     track_history_column_list: list
     track_history_except_column_list: list
+    snapshot_version_type: str = None
 
 
 @dataclass
@@ -324,6 +358,10 @@ class DataflowSpecUtils:
         # legacy dataflowspec rows.
         "rowFilter",
         "quarantineRowFilter",
+        # UC column-level governance. Both default to ``None`` for legacy
+        # dataflowspec rows written before this feature.
+        "columnComments",
+        "columnMasks",
     ]
     additional_silver_df_columns = [
         "dataQualityExpectations",
@@ -342,20 +380,160 @@ class DataflowSpecUtils:
         # UC row-level security (issue #303). See bronze entry above.
         "rowFilter",
         "quarantineRowFilter",
+        # UC column-level governance. See bronze entry above.
+        "columnComments",
+        "columnMasks",
     ]
     additional_cdc_apply_changes_columns = ["flow_name", "once"]
     apply_changes_from_snapshot_api_attributes = [
         "keys",
         "scd_type",
         "track_history_column_list",
-        "track_history_except_column_list"
+        "track_history_except_column_list",
+        # Optional: canonical Spark/DDL type of the snapshot version stamped
+        # into the SCD2 __START_AT / __END_AT columns. Enables column
+        # comments/masks on an SCD2 snapshot target (see ApplyChangesFromSnapshot).
+        "snapshot_version_type",
     ]
     apply_changes_from_snapshot_api_mandatory_attributes = ["keys", "scd_type"]
-    additional_apply_changes_from_snapshot_columns = ["track_history_column_list", "track_history_except_column_list"]
+    additional_apply_changes_from_snapshot_columns = [
+        "track_history_column_list",
+        "track_history_except_column_list",
+        # Defaults to None (via populate_additional_df_cols) so legacy
+        # dataflowspec rows load without a rewrite.
+        "snapshot_version_type",
+    ]
     apply_changes_from_snapshot_api_attributes_defaults = {
         "track_history_column_list": None,
-        "track_history_except_column_list": None
+        "track_history_except_column_list": None,
+        "snapshot_version_type": None,
     }
+
+    @staticmethod
+    def _type_to_ddl(data_type):
+        """Render a ``DataType`` to a DDL type string preserving nullability.
+
+        ``DataType.simpleString()`` flattens *nested* nullability: it renders
+        a non-nullable struct field, an ``ArrayType(..., containsNull=False)``
+        or a ``MapType(..., valueContainsNull=False)`` exactly like their
+        nullable counterparts. This recursive renderer keeps the nullability
+        that Spark DDL can express — a struct field's ``NOT NULL`` at any
+        nesting depth (top-level, or inside an array / map / struct) — so the
+        emitted DDL round-trips faithfully.
+
+        Note the one nullability flag Spark DDL genuinely *cannot* express:
+        ``ArrayType.containsNull`` / ``MapType.valueContainsNull``. There is no
+        DDL syntax for element / value nullability (``array<string not null>``
+        is a parse error), and ``DataType.sql`` / ``catalogString`` omit it
+        too. Those flags therefore stay widened to nullable — a safe widening
+        (the declared schema never claims non-null where the data allows
+        nulls); only the element type itself is recursed into so a struct
+        nested inside an array/map still keeps its ``NOT NULL`` fields.
+        """
+        if isinstance(data_type, StructType):
+            rendered = []
+            for f in data_type.fields:
+                # Backtick-delimit + double embedded backticks, exactly like
+                # top-level field names, so a nested field name containing a
+                # backtick / space / comma / colon still renders well-formed
+                # DDL rather than corrupting the struct definition.
+                escaped_name = f.name.replace("`", "``")
+                piece = f"`{escaped_name}`:{DataflowSpecUtils._type_to_ddl(f.dataType)}"
+                if not f.nullable:
+                    piece += " NOT NULL"
+                rendered.append(piece)
+            return f"struct<{','.join(rendered)}>"
+        if isinstance(data_type, ArrayType):
+            return f"array<{DataflowSpecUtils._type_to_ddl(data_type.elementType)}>"
+        if isinstance(data_type, MapType):
+            return (
+                f"map<{DataflowSpecUtils._type_to_ddl(data_type.keyType)},"
+                f"{DataflowSpecUtils._type_to_ddl(data_type.valueType)}>"
+            )
+        return data_type.simpleString()
+
+    @staticmethod
+    def build_schema_ddl(struct_schema, column_comments=None, column_masks=None):
+        """Render a StructType into a SQL DDL-string schema, splicing in UC
+        column ``COMMENT`` and ``MASK`` clauses.
+
+        Column masks cannot be expressed through ``StructField.metadata`` —
+        DLT ignores it — so a table that needs masks must be created with a
+        DDL-string schema. This helper takes the derived StructType and emits
+        ``` `name` type [NOT NULL] [COMMENT '...'] [MASK <clause>] ``` per
+        field, in schema order (so appended SCD2 ``__START_AT`` / ``__END_AT``
+        columns stay trailing).
+
+        Args:
+            struct_schema: a ``pyspark.sql.types.StructType`` (or ``None``).
+            column_comments: optional ``{column_name: comment_text}``.
+            column_masks: optional ``{column_name: mask_clause}`` where the
+                clause is spliced verbatim after ``MASK`` (validated upstream
+                at onboarding time by
+                :func:`databricks.labs.sdp_meta.identifiers.validate_column_mask_clause`).
+
+        Returns:
+            The DDL string, or ``None`` when ``struct_schema`` is ``None`` or
+            no comments/masks are supplied — signalling callers to fall back
+            to the original schema unchanged (zero behaviour change when the
+            feature is unused).
+
+        Raises:
+            ValueError: if a *mask* names a column absent from the schema.
+                Silently dropping a mask is a security regression (the
+                operator believes a column is protected when it is not), so
+                masks fail closed. A *comment* on an absent column is skipped
+                with a warning instead.
+        """
+        column_comments = column_comments or {}
+        column_masks = column_masks or {}
+        if struct_schema is None or (not column_comments and not column_masks):
+            return None
+
+        field_names = {field.name for field in struct_schema.fields}
+        missing_masks = set(column_masks) - field_names
+        if missing_masks:
+            raise ValueError(
+                "column_masks reference column(s) not present in the derived "
+                f"schema: {sorted(missing_masks)}. Available columns: "
+                f"{sorted(field_names)}."
+            )
+        for missing_comment in sorted(set(column_comments) - field_names):
+            logger.warning(
+                "column_comments reference column %r not present in the "
+                "derived schema; skipping.", missing_comment
+            )
+
+        columns = []
+        for field in struct_schema.fields:
+            # Escape embedded backticks in the field name (``a`b`` -> ``a``b``)
+            # so a column whose name contains a backtick still renders a valid
+            # delimited identifier rather than corrupting the DDL.
+            escaped_name = field.name.replace("`", "``")
+            parts = [f"`{escaped_name}` {DataflowSpecUtils._type_to_ddl(field.dataType)}"]
+            if not field.nullable:
+                parts.append("NOT NULL")
+            if field.name in column_comments:
+                # Escape backslashes BEFORE single quotes. Databricks SQL
+                # treats ``\'`` as an escaped quote, so doubling only the
+                # quotes would let a comment like ``\'; DROP TABLE x; --``
+                # terminate the string literal and inject SQL. Doubling the
+                # backslashes first neutralises that escape, then the quotes
+                # are doubled per the SQL string-literal rules.
+                escaped = (
+                    column_comments[field.name]
+                    .replace("\\", "\\\\")
+                    .replace("'", "''")
+                )
+                parts.append(f"COMMENT '{escaped}'")
+            # An empty mask value (``{"col": ""}``) would render an invalid
+            # bare ``MASK``; skip it. Validation drops these up front, but the
+            # renderer stays defensive against specs stored before that fix.
+            mask = column_masks.get(field.name)
+            if mask:
+                parts.append(f"MASK {mask}")
+            columns.append(" ".join(parts))
+        return ", ".join(columns)
 
     @staticmethod
     def _get_dataflow_spec(

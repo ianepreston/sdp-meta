@@ -22,8 +22,11 @@ from databricks.labs.sdp_meta.dataflow_spec import (
 )
 from databricks.labs.sdp_meta.identifiers import (
     SUPPORTED_SOURCE_FORMATS,
+    validate_column_comments,
+    validate_column_masks,
     validate_scd_type,
     validate_sequence_by,
+    validate_snapshot_version_type,
     validate_source_format,
     validate_sql_where_clause,
     validate_uc_column_list,
@@ -503,6 +506,20 @@ class OnboardDataflowspec:
                         validate_sql_where_clause,
                         {},
                     ),
+                    # UC column-level governance. Both are JSON objects keyed
+                    # by column name: comments carry free text emitted as an
+                    # escaped ``COMMENT '...'`` literal; masks carry a
+                    # ``cat.schema.fn USING COLUMNS (...)`` clause spliced
+                    # after ``MASK`` in the generated DDL-string schema. The
+                    # mask validator runs the same denylist guard as the row
+                    # filters plus a strict function-name / USING-COLUMNS
+                    # parse (see identifiers.validate_column_masks).
+                    (
+                        f"{layer}_column_comments",
+                        validate_column_comments,
+                        {},
+                    ),
+                    (f"{layer}_column_masks", validate_column_masks, {}),
                 ]
                 for field, validator, kwargs in checks:
                     value = row_dict.get(field)
@@ -594,6 +611,26 @@ class OnboardDataflowspec:
                                 cdc_block[col_field],
                                 kind=f"flow {flow_id} {cdc_field}.{col_field}",
                             )
+                    # snapshot_version_type is only meaningful on the
+                    # apply_changes_from_snapshot block (there is no sequence_by
+                    # there to derive the SCD2 __START_AT/__END_AT type from).
+                    # Semantics: validate whenever an explicit NON-None value is
+                    # present — so an empty string / garbage is rejected here
+                    # with a clear message instead of silently falling through
+                    # to the runtime fail-closed "no type declared" error. A
+                    # None / absent value means "unset" and legitimately falls
+                    # through (Spark JSON inference also injects None for rows
+                    # that omit the field when a sibling row sets it, so a bare
+                    # ``in`` presence check would false-positive on those).
+                    if (
+                        cdc_field.endswith("apply_changes_from_snapshot")
+                        and cdc_block.get("snapshot_version_type") is not None
+                    ):
+                        _check(
+                            validate_snapshot_version_type,
+                            cdc_block["snapshot_version_type"],
+                            kind=f"flow {flow_id} {cdc_field}.snapshot_version_type",
+                        )
 
                 # Each append flow has its own source_format which drives
                 # a separate read path; validate every one.
@@ -1305,6 +1342,10 @@ class OnboardDataflowspec:
             # and silently dropped on non-UC pipelines.
             "rowFilter",
             "quarantineRowFilter",
+            # UC column-level governance. JSON-object strings keyed by column
+            # name; optional. Masks are dropped on non-UC pipelines.
+            "columnComments",
+            "columnMasks",
         ]
         data_flow_spec_schema = StructType(
             [
@@ -1354,6 +1395,8 @@ class OnboardDataflowspec:
                 ),
                 StructField("rowFilter", StringType(), True),
                 StructField("quarantineRowFilter", StringType(), True),
+                StructField("columnComments", StringType(), True),
+                StructField("columnMasks", StringType(), True),
             ]
         )
         data = []
@@ -1506,7 +1549,10 @@ class OnboardDataflowspec:
                     data_quality_expectations = self.__get_data_quality_expecations(
                         bronze_data_quality_expectations_json
                     )
-                    if onboarding_row["bronze_quarantine_table"]:
+                    if (
+                        "bronze_quarantine_table" in onboarding_row
+                        and onboarding_row["bronze_quarantine_table"]
+                    ):
                         quarantine_target_details, quarantine_table_properties = self.__get_quarantine_details(
                             env, "bronze", onboarding_row
                         )
@@ -1529,6 +1575,12 @@ class OnboardDataflowspec:
                     and onboarding_row["bronze_quarantine_row_filter"]
                 )
                 else None
+            )
+            bronze_column_comments = self.__get_column_policy_json(
+                onboarding_row, "bronze_column_comments"
+            )
+            bronze_column_masks = self.__get_column_policy_json(
+                onboarding_row, "bronze_column_masks", cleaner=validate_column_masks
             )
             bronze_row = (
                 bronze_data_flow_spec_id,
@@ -1555,6 +1607,8 @@ class OnboardDataflowspec:
                 cdc_apply_changes_flows_schemas,
                 bronze_row_filter,
                 bronze_quarantine_row_filter,
+                bronze_column_comments,
+                bronze_column_masks,
             )
             data.append(bronze_row)
             # logger.info(bronze_parition_columns)
@@ -1564,6 +1618,41 @@ class OnboardDataflowspec:
         ).toDF(*data_flow_spec_columns)
 
         return data_flow_spec_rows_df
+
+    def __get_column_policy_json(self, onboarding_row, key, cleaner=None):
+        """Return the ``*_column_comments`` / ``*_column_masks`` value as a
+        JSON string, or ``None`` when absent/empty.
+
+        The onboarding file carries these as JSON objects keyed by column
+        name; the dataflowspec table stores them as a ``StringType`` JSON
+        string (like ``dataQualityExpectations``). ``spark.read.json`` infers
+        a *unified* struct across all rows, so a row that didn't set this key
+        still surfaces a struct whose fields (contributed by other rows) are
+        all ``None`` — those phantom keys are dropped here so each row keeps
+        only its own entries. A plain JSON string is passed through unchanged.
+
+        When ``cleaner`` is supplied it is the field's validator
+        (:func:`identifiers.validate_column_masks`), re-run here so the
+        *persisted* spec matches what pre-flight accepted — in particular
+        empty mask values are dropped rather than stored (they would render
+        an invalid bare ``MASK`` and are safely skipped by the renderer, but
+        should not be persisted). Without a cleaner, only phantom ``None``
+        keys are dropped (comments keep empty values, which render a valid
+        ``COMMENT ''``)."""
+        if key not in onboarding_row or onboarding_row[key] is None:
+            return None
+        value = onboarding_row[key]
+        if hasattr(value, "asDict"):
+            value = value.asDict(recursive=True)
+        if cleaner is not None:
+            cleaned = cleaner(value)
+            return json.dumps(cleaned) if cleaned else None
+        if isinstance(value, dict):
+            value = {k: v for k, v in value.items() if v is not None}
+            return json.dumps(value) if value else None
+        if isinstance(value, str):
+            return value if value else None
+        return json.dumps(value)
 
     def __parse_cluster_by_string(self, cluster_by_value, cluster_key):
         """Parse string representation of list into actual list."""
@@ -1692,12 +1781,18 @@ class OnboardDataflowspec:
         quarantine_table_cluster_by_auto = self.__get_cluster_by_auto(
             onboarding_row, f"{layer}_quarantine_table_cluster_by_auto"
         )
+        quarantine_table = (
+            onboarding_row[f"{layer}_quarantine_table"]
+            if f"{layer}_quarantine_table" in onboarding_row
+            else None
+        )
         if (
             f"{layer}_database_quarantine_{env}" in onboarding_row
             and onboarding_row[f"{layer}_database_quarantine_{env}"]
+            and quarantine_table
         ):
             quarantine_target_details = {"database": onboarding_row[f"{layer}_database_quarantine_{env}"],
-                                         "table": onboarding_row[f"{layer}_quarantine_table"],
+                                         "table": quarantine_table,
                                          "partition_columns": quarantine_table_partition_columns,
                                          "cluster_by": quarantine_table_cluster_by,
                                          "cluster_by_auto": quarantine_table_cluster_by_auto
@@ -1711,8 +1806,10 @@ class OnboardDataflowspec:
                 quarantine_target_details["catalog"] = quarantine_catalog
             if f"{layer}_quarantine_table_comment" in onboarding_row:
                 quarantine_target_details["comment"] = onboarding_row[f"{layer}_quarantine_table_comment"]
-        if not self.uc_enabled and f"{layer}_quarantine_table_path_{env}" in onboarding_row:
-            quarantine_target_details["path"] = onboarding_row[f"{layer}_quarantine_table_path_{env}"]
+            # Path stays nested under the valid-table branch so the helper never
+            # returns a lone ``{"path": ...}`` for a missing quarantine table.
+            if not self.uc_enabled and f"{layer}_quarantine_table_path_{env}" in onboarding_row:
+                quarantine_target_details["path"] = onboarding_row[f"{layer}_quarantine_table_path_{env}"]
 
         return quarantine_target_details, quarantine_table_properties
 
@@ -2276,6 +2373,10 @@ class OnboardDataflowspec:
             # and silently dropped on non-UC pipelines.
             "rowFilter",
             "quarantineRowFilter",
+            # UC column-level governance. JSON-object strings keyed by column
+            # name; optional. Masks are dropped on non-UC pipelines.
+            "columnComments",
+            "columnMasks",
         ]
         data_flow_spec_schema = StructType(
             [
@@ -2312,6 +2413,8 @@ class OnboardDataflowspec:
                 StructField("cdcApplyChangesFlows", StringType(), True),
                 StructField("rowFilter", StringType(), True),
                 StructField("quarantineRowFilter", StringType(), True),
+                StructField("columnComments", StringType(), True),
+                StructField("columnMasks", StringType(), True),
             ]
         )
         data = []
@@ -2515,14 +2618,28 @@ class OnboardDataflowspec:
                     data_quality_expectations = self.__get_data_quality_expecations(
                         silver_data_quality_expectations_json
                     )
-                silver_quarantine_target_details, silver_quarantine_table_properties = self.__get_quarantine_details(
-                    env, "silver", onboarding_row
-                )
-                silver_quarantine_cluster_by = self.__get_cluster_by_properties(
-                    onboarding_row,
-                    silver_quarantine_table_properties,
-                    "silver_quarantine_cluster_by"
-                )
+                # Quarantine construction is reachable whenever the DQE column
+                # exists, independent of its truthiness -- this preserves the
+                # prior silver behavior (a defined quarantine table must still
+                # build a target even when the DQE value is falsy). The gate
+                # itself mirrors bronze: DQE without a quarantine table yields an
+                # empty quarantine target (a quarantine DB with no table name is
+                # not a valid quarantine target), not a crash on a missing
+                # ``silver_quarantine_table`` column (issue #3).
+                silver_quarantine_target_details = {}
+                if (
+                    "silver_quarantine_table" in onboarding_row
+                    and onboarding_row["silver_quarantine_table"]
+                ):
+                    (
+                        silver_quarantine_target_details,
+                        silver_quarantine_table_properties,
+                    ) = self.__get_quarantine_details(env, "silver", onboarding_row)
+                    silver_quarantine_cluster_by = self.__get_cluster_by_properties(
+                        onboarding_row,
+                        silver_quarantine_table_properties,
+                        "silver_quarantine_cluster_by"
+                    )
             append_flows, append_flow_schemas = self.get_append_flows_json(
                 onboarding_row, layer="silver", env=env
             )
@@ -2553,6 +2670,12 @@ class OnboardDataflowspec:
                 )
                 else None
             )
+            silver_column_comments = self.__get_column_policy_json(
+                onboarding_row, "silver_column_comments"
+            )
+            silver_column_masks = self.__get_column_policy_json(
+                onboarding_row, "silver_column_masks", cleaner=validate_column_masks
+            )
             silver_row = (
                 silver_data_flow_spec_id,
                 silver_data_flow_spec_group,
@@ -2577,6 +2700,8 @@ class OnboardDataflowspec:
                 silver_cdc_apply_changes_flows,
                 silver_row_filter,
                 silver_quarantine_row_filter,
+                silver_column_comments,
+                silver_column_masks,
             )
             data.append(silver_row)
             logger.info(f"silver_data ==== {data}")
